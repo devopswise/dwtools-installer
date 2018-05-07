@@ -1,0 +1,272 @@
+#!/bin/bash
+
+if [[ -z "${DWTOOLS_BRANCH}" ]]; then
+  DWTOOLS_BRANCH="master"
+fi
+
+if [[ -z "${DWTOOLS_GIT_URL}" ]]; then
+  DWTOOLS_GIT_URL="https://github.com/devopswise/dwtools.git"
+fi
+
+
+DWTOOLS_SOURCE_DIR=/opt/dwtools/${DWTOOLS_BRANCH}
+TIMESTAMP=$(date "+%Y%m%d%H%M%S")
+
+if [[ -z "${AWS_DEFAULT_REGION}" ]]; then
+  export AWS_DEFAULT_REGION=eu-west-1
+fi
+
+set -e
+
+if [[ ! -z "${DEBUG}" ]]; then
+  set -o xtrace
+fi
+
+generate_pem_file() {
+  # if KEY_PAIR is not defined we need to create one
+  if [[ -z "${KEY_PAIR}" ]]; then
+    KEY_PAIR="dwtools-${TIMESTAMP}"
+    PEM_FILE="${DWTOOLS_SOURCE_DIR}/${KEY_PAIR}.pem"
+    echo generating new key-pair : ${KEY_PAIR}
+    aws ec2 create-key-pair --key-name  "dwtools-${TIMESTAMP}" \
+      --query 'KeyMaterial' --output text > ${PEM_FILE}
+    if [ $? -ne 0 ]; then
+      echo 'Cannot create key pair'
+      exit 1
+    fi
+    chmod 400 ${PEM_FILE}
+  else
+    if [[ ! -r "${PEM_FILE}" ]]; then
+      echo "${PEM_FILE} is not readable by installer, please \
+            use chown 1000:1000 mypemfile.pem"
+      exit 1
+    else
+      echo using KEY_PAIR\(${KEY_PAIR}\) and PEM_FILE \(${PEM_FILE}\) provided.
+    fi
+  fi
+}
+
+provision_server() {
+  #create a vpc
+  vpcId=$(aws ec2 create-vpc --cidr-block 10.0.0.0/28 --query 'Vpc.VpcId' --output text)
+  echo "vpcId="$vpcId > ${DWTOOLS_SOURCE_DIR}/.aws-config
+  
+  #enable dns
+  aws ec2 modify-vpc-attribute --vpc-id $vpcId --enable-dns-support "{\"Value\":true}"
+  aws ec2 modify-vpc-attribute --vpc-id $vpcId --enable-dns-hostnames "{\"Value\":true}"
+
+  #Add Internet gateway
+  internetGatewayId=$(aws ec2 create-internet-gateway --query 'InternetGateway.InternetGatewayId' --output text)
+  aws ec2 attach-internet-gateway --internet-gateway-id $internetGatewayId --vpc-id $vpcId
+  echo "internetGatewayId="$internetGatewayId >> ${DWTOOLS_SOURCE_DIR}/.aws-config
+  
+  #create a subnet
+  subnetId=$(aws ec2 create-subnet --vpc-id $vpcId --cidr-block 10.0.0.0/28 --query 'Subnet.SubnetId' --output text)
+  aws ec2 modify-subnet-attribute --subnet-id $subnetId --map-public-ip-on-launch
+  echo "subnetId="$subnetId >> ${DWTOOLS_SOURCE_DIR}/.aws-config
+  
+  #configure route table
+  routeTableId=$(aws ec2 create-route-table --vpc-id $vpcId --query 'RouteTable.RouteTableId' --output text)
+  echo "routeTableId="$routeTableId >> ${DWTOOLS_SOURCE_DIR}/.aws-config
+  aws ec2 associate-route-table --route-table-id $routeTableId --subnet-id $subnetId >> /dev/null
+  aws ec2 create-route --route-table-id $routeTableId --destination-cidr-block 0.0.0.0/0 --gateway-id $internetGatewayId >> /dev/null
+
+  #add a security group
+  securityGroupId=$(aws ec2 create-security-group --group-name my-security-group --description "my-security-group" \
+    --vpc-id $vpcId --query 'GroupId' --output text)
+  aws ec2 authorize-security-group-ingress --group-id $securityGroupId --protocol tcp --port 22 --cidr 0.0.0.0/0
+  aws ec2 authorize-security-group-ingress --group-id $securityGroupId --protocol tcp --port 443 --cidr 0.0.0.0/0
+  aws ec2 authorize-security-group-ingress --group-id $securityGroupId --protocol tcp --port 80 --cidr 0.0.0.0/0
+  aws ec2 authorize-security-group-ingress --group-id $securityGroupId --protocol tcp --port 8080 --cidr 0.0.0.0/0
+  echo "securityGroupId="$securityGroupId >> ${DWTOOLS_SOURCE_DIR}/.aws-config
+  
+  #create ec2 instance
+  echo creating new ec2 instance
+  instance_id=$(aws ec2 run-instances --image-id ami-6e28b517 --count 1 \
+    --instance-type t2.micro --key-name ${KEY_PAIR} --security-group-ids $securityGroupId --subnet-id $subnetId \
+    --instance-initiated-shutdown-behavior terminate \
+    --output text --query 'Instances[*].InstanceId')
+  echo "instanceId="$instance_id >> ${DWTOOLS_SOURCE_DIR}/.aws-config
+  echo A new EC2 instance is created instance_id:$instance_id
+  echo waiting $instance_id to become alive:
+  while state=$(aws ec2 describe-instances --instance-ids $instance_id --output text \
+      --query 'Reservations[*].Instances[*].State.Name'); test "$state" = "pending"; do
+    sleep 1; echo -n '.'
+  done; echo " $state"
+  PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $instance_id | \
+    grep PublicIpAddress | awk -F ":" '{print $2}' | sed 's/[",]//g' | tr -d ' ')
+  echo public_ip=${PUBLIC_IP}
+  
+  if [[ ! -z "${ELASTIC_IP}" ]]; then
+    echo "ELASTIC_IP is defined. associating it with instance"
+    aws ec2 associate-address --instance-id $instance_id --public-ip ${ELASTIC_IP}
+    echo $ELASTIC_IP is now associated with $instance_id
+    PUBLIC_IP=${ELASTIC_IP}
+  fi
+}
+
+setup_fqdn() {
+  if [[ -z "${SERVER_FQDN}" ]]; then
+    echo "using xip.io for fqdn"
+    SERVER_FQDN=${PUBLIC_IP}.xip.io
+  else
+    echo "SERVER_FQDN is defined. using ${SERVER_FQDN} instead of XIP.IO"
+  fi
+}
+
+display_server_vars() {
+  echo SERVER_FQDN=${SERVER_FQDN} 
+  echo PUBLIC_IP=${PUBLIC_IP}
+  echo PEM_FILE=${PEM_FILE}
+  echo KEY_PAIR=${KEY_PAIR}
+  echo SERVER_FQDN=${SERVER_FQDN} >> ${DWTOOLS_SOURCE_DIR}/.aws-config
+  echo PUBLIC_IP=${PUBLIC_IP} >> ${DWTOOLS_SOURCE_DIR}/.aws-config
+  echo PEM_FILE=${PEM_FILE} >> ${DWTOOLS_SOURCE_DIR}/.aws-config
+  echo KEY_PAIR=${KEY_PAIR} >> ${DWTOOLS_SOURCE_DIR}/.aws-config
+  echo provisioning completed.
+}
+
+get_sources() {
+  mkdir -p ${DWTOOLS_SOURCE_DIR}
+  
+  if [ ! -f ${DWTOOLS_SOURCE_DIR}/.dwtools-version ]; then
+      git clone -b ${DWTOOLS_BRANCH} ${DWTOOLS_GIT_URL} \
+        ${DWTOOLS_SOURCE_DIR}
+  else
+      git -C ${DWTOOLS_SOURCE_DIR} checkout inventories/pro/hosts
+      git -C ${DWTOOLS_SOURCE_DIR} checkout inventories/pro/group_vars/all/vars.yml
+  fi
+}
+
+set_config_vars() {
+  sed -i "s@__dw_server_fqdn__@${SERVER_FQDN}@g" \
+           ${DWTOOLS_SOURCE_DIR}/inventories/pro/hosts
+  sed -i "s@__dw_private_key__@${PEM_FILE}@g" \
+           ${DWTOOLS_SOURCE_DIR}/inventories/pro/hosts
+  sed -i "s@__base_domain__@${SERVER_FQDN}@g" \
+           ${DWTOOLS_SOURCE_DIR}/inventories/pro/group_vars/all/vars.yml
+}
+
+run_ansible_code() {
+  echo ansible-playbook -i ${DWTOOLS_SOURCE_DIR}/inventories/pro \
+    ${DWTOOLS_SOURCE_DIR}/site.yml ${DEBUG}\
+    --vault-password-file=${DWTOOLS_SOURCE_DIR}/ansible-vault-pass
+  OLD_PWD=$PWD
+  echo $OLD_PWD
+  cd $DWTOOLS_SOURCE_DIR
+  ansible-playbook -i ${DWTOOLS_SOURCE_DIR}/inventories/pro \
+    ${DWTOOLS_SOURCE_DIR}/site.yml ${DEBUG} \
+    --vault-password-file=${DWTOOLS_SOURCE_DIR}/ansible-vault-pass
+  cd $OLD_PWD
+}
+
+display_development_info() {
+  echo *** DONE  ***
+  echo dwtools installed on ${SERVER_FQDN}, you can access tools www.${SERVER_FQDN}
+  echo server will be terminated automatically in 2 hours, incase you forgot to terminate it
+  echo get into dwtools-installer container first
+  echo   docker exec -it dwtools-installer bash
+  echo then, you can either sssh to your instance by typing
+  echo   ssh -i ${PEM_FILE} centos@${SERVER_FQDN}
+  echo or you can modify ansible code in $DWTOOLS_SOURCE_DIR, then apply changes by typing,
+  echo   ansible-playbook -i ${DWTOOLS_SOURCE_DIR}/inventories/pro \
+         ${DWTOOLS_SOURCE_DIR}/site.yml -vv \
+         --vault-password-file=${DWTOOLS_SOURCE_DIR}/ansible-vault-pass
+}
+
+terminate_server() {
+  aws ec2 terminate-instances --instance-ids $instanceId ${DRY_RUN} > /dev/null
+  while state=$(aws ec2 describe-instances --instance-ids $instanceId --output text \
+      --query 'Reservations[*].Instances[*].State.Name'); test "$state" = "shutting-down"; do
+    sleep 2; echo -n '.'
+  done; echo " $state"
+
+  #aws release-address --public-ip $PUBLIC_IP
+  aws ec2 detach-internet-gateway --internet-gateway-id $internetGatewayId --vpc-id $vpcId ${DRY_RUN}
+  aws ec2 delete-internet-gateway --internet-gateway-id $internetGatewayId ${DRY_RUN}
+
+  aws ec2 delete-security-group --group-id $securityGroupId ${DRY_RUN}
+  aws ec2 delete-subnet --subnet-id $subnetId ${DRY_RUN}
+  aws ec2 delete-route-table --route-table-id $routeTableId ${DRY_RUN}
+  aws ec2 delete-vpc --vpc-id $vpcId ${DRY_RUN}
+  rm ${DWTOOLS_SOURCE_DIR}/.aws-config
+}
+
+print_banner() {
+
+echo '      _          _              _     '
+echo '     | |        | |            | |    '
+echo '   __| |_      _| |_ ___   ___ | |___ '
+echo '  / _` \ \ /\ / / __/ _ \ / _ \| / __|'
+echo ' | (_| |\ V  V /| || (_) | (_) | \__ \'
+echo '  \__,_| \_/\_/  \__\___/ \___/|_|___/'
+echo ''
+}
+
+launch() {
+  print_banner
+  echo "Launching dwtools..."
+  get_sources
+  generate_pem_file
+  provision_server
+  setup_fqdn
+  set_config_vars
+  run_ansible_code
+  display_server_vars
+  display_development_info
+}
+
+terminate() {
+  if [ -f ${DWTOOLS_SOURCE_DIR}/.aws-config ]; then
+    . ${DWTOOLS_SOURCE_DIR}/.aws-config
+    echo "This will remove target server, you can always re-launch,"
+    echo "a new server but you will lose data inside it if you didn't backup"
+    while true; do
+      read -p "Do you wish to terminate server?" yn
+      case $yn in
+          [Yy]* ) terminate_server; break;;
+          [Nn]* ) exit;;
+          * ) echo "Please answer yes or no.";;
+      esac
+    done
+  else
+    echo "no servers found. check .aws-config file"
+  fi
+}
+
+ssh_connect() {
+  if [ -f ${DWTOOLS_SOURCE_DIR}/.aws-config ]; then
+    . ${DWTOOLS_SOURCE_DIR}/.aws-config
+    ssh -i ${PEM_FILE} centos@${SERVER_FQDN}
+  else
+    "no servers found. check .aws-config file"
+  fi
+}
+
+show_usage() {
+  echo "Usage: $0 <operation>"
+  echo "where operation is one of "
+  echo " --launch     launches new instance"
+  echo " --terminate  terminate instance"
+  echo " --ssh        connect running to instance using ssh"
+}
+
+case "$1" in
+   --launch|-l)
+      launch
+      ;;
+   --terminate|-t)
+      terminate
+      ;;
+   --ssh|-s)
+      ssh_connect
+      ;;
+   *)
+      show_usage
+      ;;
+esac
+
+exit 0
+
+
+
