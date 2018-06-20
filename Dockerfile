@@ -9,6 +9,8 @@ RUN pip install -U pip setuptools virtualenv
 
 RUN pip install awscli ansible==2.4.0
 
+RUN echo 'syntax on' >> /etc/vim/vimrc
+COPY script/.bashrc /root/.bashrc
 ENV PATH="${PATH}:/"
 
 COPY dwtools /dwtools
