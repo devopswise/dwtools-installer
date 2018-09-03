@@ -13,7 +13,7 @@ RUN echo 'syntax on' >> /etc/vim/vimrc
 COPY script/.bashrc /root/.bashrc
 ENV PATH="${PATH}:/"
 
-COPY dwtools /dwtools
+COPY script/dwtools /dwtools
 
 ENTRYPOINT ["/bin/bash","-c"]
 CMD ["sleep infinity"]
