@@ -88,7 +88,7 @@ provision_server() {
   echo creating new ec2 instance
   instance_id=$(aws ec2 run-instances --image-id ami-6e28b517 --count 1 \
     --instance-type ${AWS_INSTANCE_TYPE} --key-name ${KEY_PAIR} --security-group-ids $securityGroupId --subnet-id $subnetId \
-    --block-device-mapping /dev/sda1=:16:false \
+    --block-device-mapping 'DeviceName=/dev/sda1,Ebs={VolumeSize=16}' \
     --instance-initiated-shutdown-behavior stop \
     --output text --query 'Instances[*].InstanceId')
   echo "instanceId="$instance_id >> ${DWTOOLS_SOURCE_DIR}/.aws-config
